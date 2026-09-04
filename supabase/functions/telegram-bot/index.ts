@@ -314,28 +314,64 @@ async function handleCallback(update: TelegramUpdate): Promise<Response> {
     return new Response('OK', { status: 200 });
   }
 
-  // Buy — show payment options
+  // Buy — create order from product, then show payment options
   if (data.startsWith('buy:')) {
-    const orderId = data.split(':')[1];
-    const { data: order } = await supabase
-      .from('orders')
-      .select('id, number, total, status')
-      .eq('id', orderId)
+    const productId = data.split(':')[1];
+    const { data: product } = await supabase
+      .from('products')
+      .select('id, name, price, stock, is_active')
+      .eq('id', productId)
       .maybeSingle();
-    if (!order) {
-      await tgSendMessage(chatId, 'Замовлення не знайдено.');
+    if (!product) {
+      await tgSendMessage(chatId, 'Товар не знайдено.');
       return new Response('OK', { status: 200 });
     }
-    if (order.status === 'paid' || order.status === 'shipped' || order.status === 'delivered') {
-      await tgSendMessage(chatId, '✅ Це замовлення вже оплачено.');
+    const p = product as { id: string; name: string; price: number; stock: number; is_active: boolean };
+    if (!p.is_active) {
+      await tgSendMessage(chatId, 'Цей товар більше не доступний.');
       return new Response('OK', { status: 200 });
     }
+    if (p.stock <= 0) {
+      await tgSendMessage(chatId, '❌ На жаль, цього товару немає в наявності.');
+      return new Response('OK', { status: 200 });
+    }
+    const orderNumber = `TG-${Date.now().toString(36).toUpperCase()}`;
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .insert({
+        number: orderNumber,
+        bot_user_id: botUser.id,
+        status: 'new',
+        total: p.price,
+        customer_name: botUser.first_name || botUser.username || '',
+      })
+      .select('id, number, total, status')
+      .single();
+    if (orderError || !order) {
+      await tgSendMessage(chatId, '❌ Не вдалося створити замовлення. Спробуйте пізніше.');
+      return new Response('OK', { status: 200 });
+    }
+    await supabase.from('order_items').insert({
+      order_id: order.id,
+      product_id: p.id,
+      name: p.name,
+      price: p.price,
+      quantity: 1,
+    });
+    await supabase.from('order_status_history').insert({
+      order_id: order.id,
+      status: 'new',
+      note: 'Замовлення створено з Telegram-бота',
+    });
+    await supabase.from('products').update({ stock: p.stock - 1 }).eq('id', p.id);
     const providers = await getEnabledProviders();
-    const providerList = providers.map((p) => ({ name: p.name, label: p.label }));
-    const kb = paymentKeyboard(orderId, providerList);
-    const text = `💳 <b>Замовлення №${order.number}</b>\n\nСума: ${order.total} грн\n\nОберіть спосіб оплати:`;
+    const providerList = providers.map((pr) => ({ name: pr.name, label: pr.label }));
+    const kb = paymentKeyboard(order.id, providerList);
+    const text = `💳 <b>Замовлення №${order.number}</b>\n\nТовар: ${p.name}\nСума: ${order.total} грн\n\nОберіть спосіб оплати:`;
     await tgSendMessage(chatId, text, kb);
-    await logEvent(botUser.id, 'buy_click', { order_id: orderId });
+    await logEvent(botUser.id, 'buy_click', { order_id: order.id, product_id: productId });
+    const { notifyAdminsNewOrder } = await import('./notifications.ts');
+    await notifyAdminsNewOrder(order as never);
     return new Response('OK', { status: 200 });
   }
 
@@ -354,13 +390,18 @@ async function handleCallback(update: TelegramUpdate): Promise<Response> {
       return new Response('OK', { status: 200 });
     }
     if (providerName === 'cod') {
-      await supabase.from('orders').update({ payment_method: 'cod' }).eq('id', orderId);
+      await supabase.from('orders').update({ payment_method: 'cod', status: 'confirmed' }).eq('id', orderId);
       await tgSendMessage(
         chatId,
         '💵 <b>Післяплата обрана</b>\n\nОплата буде здійснена при отриманні товару у відділенні Нової Пошти.',
         mainMenuKeyboard,
       );
       await logEvent(botUser.id, 'payment_method_selected', { provider: 'cod', order_id: orderId });
+      return new Response('OK', { status: 200 });
+    }
+    const enabledProviders = await getEnabledProviders();
+    if (!enabledProviders.find((pr) => pr.name === providerName)) {
+      await tgSendMessage(chatId, '❌ Цей спосіб оплати недоступний.');
       return new Response('OK', { status: 200 });
     }
     const { transactionId, result } = await createPayment(providerName, {
@@ -577,10 +618,44 @@ Deno.serve(async (req: Request) => {
       const invoiceId = paymentData.invoiceId as string || paymentData.order_id as string || paymentData.orderReference as string || paymentData.payment_id as string;
       const { data: txn } = await supabase
         .from('payment_transactions')
-        .select('id, provider, order_id, status')
+        .select('id, provider, order_id, status, amount')
         .or(`payment_id.eq.${invoiceId},invoice_id.eq.${invoiceId}`)
         .maybeSingle();
       if (txn) {
+        let signatureValid = true;
+        if (txn.provider === 'liqpay') {
+          const liqpayPrivKey = Deno.env.get('LIQPAY_PRIVATE_KEY') || '';
+          const receivedSignature = (paymentData.signature as string) || '';
+          const signBase = btoa(String.fromCharCode(...new TextEncoder().encode(liqpayPrivKey)));
+          if (receivedSignature && receivedSignature !== signBase) {
+            signatureValid = false;
+          }
+        } else if (txn.provider === 'wayforpay') {
+          const wfpSecret = Deno.env.get('WAYFORPAY_MERCHANT_SECRET_KEY') || '';
+          const receivedSignature = (paymentData.merchantSignature as string) || '';
+          const signFields = [
+            paymentData.merchantAccount, paymentData.orderReference, paymentData.amount, paymentData.currency,
+            paymentData.authCode, paymentData.cardPan, paymentData.transactionStatus, paymentData.reasonCode,
+          ].filter(Boolean).map(String).join('|');
+          const expectedBytes = new TextEncoder().encode(`${wfpSecret}|${signFields}`);
+          const expectedHash = await crypto.subtle.digest('SHA-256', expectedBytes);
+          const expectedSig = Array.from(new Uint8Array(expectedHash), (b) => b.toString(16).padStart(2, '0')).join('');
+          if (receivedSignature && receivedSignature !== expectedSig) {
+            signatureValid = false;
+          }
+        } else if (txn.provider === 'monobank') {
+          if (WEBHOOK_SECRET) {
+            const secretHeader = req.headers.get('x-telegram-bot-api-secret-token') || req.headers.get('x-signature');
+            if (secretHeader !== WEBHOOK_SECRET) {
+              signatureValid = false;
+            }
+          }
+        }
+        if (!signatureValid) {
+          return new Response(JSON.stringify({ error: 'Invalid signature' }), {
+            status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
         let newStatus: PaymentStatus = 'pending';
         const statusStr = String(paymentData.status || '').toLowerCase();
         if (statusStr === 'success' || statusStr === 'approved' || statusStr === 'paid' || statusStr === 'sandbox') {
@@ -691,12 +766,28 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // Helper: verify admin_telegram_id
+    async function verifyAdmin(adminTelegramId: string | undefined): Promise<boolean> {
+      if (!adminTelegramId) return false;
+      const { data: adminRow } = await supabase
+        .from('admin_users')
+        .select('id')
+        .eq('telegram_id', adminTelegramId)
+        .maybeSingle();
+      return !!adminRow;
+    }
+
     // Admin: check payment status
     if (body.admin_action === 'check_payment') {
-      const { transaction_id } = body;
+      const { transaction_id, admin_telegram_id } = body;
       if (!transaction_id) {
         return new Response(JSON.stringify({ error: 'transaction_id required' }), {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
       const result = await checkPaymentStatus(transaction_id);
@@ -707,10 +798,15 @@ Deno.serve(async (req: Request) => {
 
     // Admin: refund payment
     if (body.admin_action === 'refund_payment') {
-      const { transaction_id, amount } = body;
+      const { transaction_id, amount, admin_telegram_id } = body;
       if (!transaction_id) {
         return new Response(JSON.stringify({ error: 'transaction_id required' }), {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
       const result = await refundPayment(transaction_id, Number(amount));
@@ -721,10 +817,15 @@ Deno.serve(async (req: Request) => {
 
     // Admin: search cities (Nova Poshta)
     if (body.admin_action === 'np_search_cities') {
-      const { query } = body;
+      const { query, admin_telegram_id } = body;
       if (!query) {
         return new Response(JSON.stringify({ error: 'query required' }), {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
       const result = await searchCities('novaposhta', { query });
@@ -735,10 +836,15 @@ Deno.serve(async (req: Request) => {
 
     // Admin: search warehouses (Nova Poshta)
     if (body.admin_action === 'np_search_warehouses') {
-      const { city_ref, warehouse_type, query } = body;
+      const { city_ref, warehouse_type, query, admin_telegram_id } = body;
       if (!city_ref) {
         return new Response(JSON.stringify({ error: 'city_ref required' }), {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
       const result = await searchWarehouses('novaposhta', {
@@ -759,17 +865,10 @@ Deno.serve(async (req: Request) => {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
-      if (admin_telegram_id) {
-        const { data: adminRow } = await supabase
-          .from('admin_users')
-          .select('id')
-          .eq('telegram_id', admin_telegram_id)
-          .maybeSingle();
-        if (!adminRow) {
-          return new Response(JSON.stringify({ error: 'Unauthorized: not an admin' }), {
-            status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
-        }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized: not an admin' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
       }
       const { data: order } = await supabase
         .from('orders')
@@ -802,10 +901,15 @@ Deno.serve(async (req: Request) => {
 
     // Admin: track shipment
     if (body.admin_action === 'track_shipment') {
-      const { shipment_id } = body;
+      const { shipment_id, admin_telegram_id } = body;
       if (!shipment_id) {
         return new Response(JSON.stringify({ error: 'shipment_id required' }), {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
       const result = await trackShipment(shipment_id);
@@ -816,10 +920,15 @@ Deno.serve(async (req: Request) => {
 
     // Admin: track by TTN
     if (body.admin_action === 'track_ttn') {
-      const { ttn } = body;
+      const { ttn, admin_telegram_id } = body;
       if (!ttn) {
         return new Response(JSON.stringify({ error: 'ttn required' }), {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
       const result = await trackShipmentByTtn(ttn);
@@ -830,10 +939,15 @@ Deno.serve(async (req: Request) => {
 
     // Admin: get shipment documents
     if (body.admin_action === 'shipment_documents') {
-      const { shipment_id } = body;
+      const { shipment_id, admin_telegram_id } = body;
       if (!shipment_id) {
         return new Response(JSON.stringify({ error: 'shipment_id required' }), {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
       const result = await getShipmentDocuments(shipment_id);
@@ -844,10 +958,15 @@ Deno.serve(async (req: Request) => {
 
     // Admin: cancel shipment
     if (body.admin_action === 'cancel_shipment') {
-      const { shipment_id } = body;
+      const { shipment_id, admin_telegram_id } = body;
       if (!shipment_id) {
         return new Response(JSON.stringify({ error: 'shipment_id required' }), {
           status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (!(await verifyAdmin(admin_telegram_id))) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
       const result = await cancelShipment(shipment_id);
@@ -884,7 +1003,7 @@ Deno.serve(async (req: Request) => {
       context: { url: req.url, method: req.method },
     });
     return new Response(
-      JSON.stringify({ error: err.message || 'Internal error' }),
+      JSON.stringify({ error: 'Internal server error' }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
     );
   }

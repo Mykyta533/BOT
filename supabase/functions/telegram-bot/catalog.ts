@@ -124,6 +124,7 @@ export async function showProductCard(
     .maybeSingle();
   const isFav = !!fav;
   const stockText = outOfStock ? '❌ Немає в наявності' : `✅ В наявності: ${p.stock} шт`;
+  const siteUrl = Deno.env.get('SITE_URL') || '';
   const productUrl = siteUrl ? `${siteUrl}/product/${productId}` : '';
   const kb = productCardKeyboard(productId, categoryId, page, isFav, productUrl || undefined);
   const discount = p.old_price && p.old_price > p.price
