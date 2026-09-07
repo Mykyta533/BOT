@@ -1,9 +1,10 @@
 services:
   - type: web
     name: telegram-shop-admin
-    runtime: node
+    runtime: static
     buildCommand: npm install && npm run build
-    startCommand: npm run start
+    staticPublishPath: ./dist
+    pullRequestBuildsFromRoot: true
     envVars:
       - key: NODE_VERSION
-        value: 20.0.0
+        value: 24.14.1
