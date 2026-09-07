@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Send, Users, CheckCircle2, XCircle } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
+import { FN_URL, SUPABASE_ANON_KEY as ANON_KEY } from '@/lib/config';
 import type { Broadcast } from '@/lib/types';
 
 const SEGMENTS = [
@@ -29,11 +30,11 @@ export function BroadcastManager() {
     if (!message.trim()) return;
     setSending(true);
     try {
-      const resp = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/telegram-bot`, {
+      const resp = await fetch(FN_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          Authorization: `Bearer ${ANON_KEY}`,
         },
         body: JSON.stringify({
           admin_action: 'broadcast',

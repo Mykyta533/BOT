@@ -12,8 +12,7 @@ import {
   Key,
 } from 'lucide-react';
 
-const FN_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/telegram-bot`;
-const ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+import { FN_URL, SUPABASE_ANON_KEY as ANON_KEY } from '@/lib/config';
 
 interface WebhookInfo {
   url: string;
